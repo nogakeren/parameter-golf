@@ -1156,8 +1156,8 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                torch.compiler.cudagraph_mark_step_begin()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    torch.compiler.cudagraph_mark_step_begin()
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1223,8 +1223,8 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                torch.compiler.cudagraph_mark_step_begin()
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
