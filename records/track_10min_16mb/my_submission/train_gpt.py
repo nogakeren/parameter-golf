@@ -904,7 +904,7 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, tied_weight: Tensor | None = None) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -937,7 +937,9 @@ class GPT(nn.Module):
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x_flat, self.tok_emb.weight)
+            # Use the injected eager weight to bypass the compiler bug
+            w = tied_weight if tied_weight is not None else self.tok_emb.weight
+            logits_proj = F.linear(x_flat, w)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -1778,7 +1780,9 @@ def main() -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     torch.compiler.cudagraph_mark_step_begin()
-                    warmup_loss = model(x, y)
+                    # Clone outside the compiled graph
+                    tied_w = base_model.tok_emb.weight.clone() if args.tie_embeddings else None
+                    warmup_loss = model(x, y, tied_w)
                 (warmup_loss * grad_scale).backward()
             # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
@@ -1848,7 +1852,9 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 torch.compiler.cudagraph_mark_step_begin()
-                loss = model(x, y)
+                # Clone outside the compiled graph
+                tied_w = base_model.tok_emb.weight.clone() if args.tie_embeddings else None
+                loss = model(x, y, tied_w)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
