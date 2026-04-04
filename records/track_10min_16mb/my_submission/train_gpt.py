@@ -335,6 +335,7 @@ def eval_val(
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                torch.compiler.cudagraph_mark_step_begin()
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -561,42 +562,19 @@ class Rotary(nn.Module):
         self.rope_dims = rope_dims if rope_dims > 0 else dim
         inv_freq = 1.0 / (base ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._cos_cached: Tensor | None = None
-        self._sin_cached: Tensor | None = None
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached != seq_len
-            or self._cos_cached.device != device
-        ):
-            rd = self.rope_dims
-            if seq_len > self.train_seq_len:
-                scale = seq_len / self.train_seq_len
-                new_base = self.base * (scale ** (rd / (rd - 2)))
-                inv_freq = 1.0 / (new_base ** (torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd))
-            else:
-                inv_freq = self.inv_freq.to(device)
-            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
-            freqs = torch.outer(t, inv_freq)
-            self._cos_cached = freqs.cos()[None, :, None, :]
-            self._sin_cached = freqs.sin()[None, :, None, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
-
-
-def warm_rotary_caches(module: nn.Module, seq_lens, device: torch.device) -> None:
-    # Populate rotary caches eagerly so torch.compile() with CUDA graphs
-    # does not capture graph outputs into module state.
-    wanted = [int(seq_len) for seq_len in dict.fromkeys(seq_lens) if int(seq_len) > 0]
-    if not wanted:
-        return
-    with torch.no_grad():
-        for submodule in module.modules():
-            if isinstance(submodule, Rotary):
-                for seq_len in wanted:
-                    submodule(seq_len, device, torch.float32)
+        rd = self.rope_dims
+        if seq_len > self.train_seq_len:
+            scale = seq_len / self.train_seq_len
+            new_base = self.base * (scale ** (rd / (rd - 2)))
+            inv_freq = 1.0 / (new_base ** (torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd))
+        else:
+            inv_freq = self.inv_freq.to(device)
+        t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+        return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
@@ -1049,9 +1027,8 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    warm_rotary_caches(base_model, [seq_len], device)
     compiled_logits = torch.compile(
-        base_model.forward_logits, dynamic=False, fullgraph=True, mode="max-autotune-no-cudagraphs"
+        base_model.forward_logits, dynamic=False, fullgraph=True, mode="max-autotune"
     )
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
@@ -1142,6 +1119,7 @@ def collect_hessians_from_tokens(hessian_model, token_seqs, device):
         for seq in token_seqs:
             x = seq[:, :-1].to(device)
             y = seq[:, 1:].to(device)
+            torch.compiler.cudagraph_mark_step_begin()
             hessian_model(x, y)
     for h in hooks:
         h.remove()
@@ -1496,6 +1474,7 @@ def collect_hessians(hessian_model, train_loader, args, device, grad_accum_steps
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for _ in range(num_batches):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            torch.compiler.cudagraph_mark_step_begin()
             hessian_model(x, y)
     for h in hooks:
         h.remove()
@@ -1675,10 +1654,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    warm_rotary_caches(base_model, [args.train_seq_len, effective_eval_seq_len], device)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, mode="max-autotune-no-cudagraphs")
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, mode="max-autotune")
     model = compiled_model
 
     # Optimizer split:
@@ -1799,6 +1777,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    torch.compiler.cudagraph_mark_step_begin()
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             # All-reduce all grads for warmup (simple, not optimized)
@@ -1868,6 +1847,7 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                torch.compiler.cudagraph_mark_step_begin()
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -2101,7 +2081,6 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    warm_rotary_caches(eval_model, [effective_eval_seq_len], device)
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True, mode="reduce-overhead")
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
