@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
-
+from enum import Enum, auto
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -24,7 +24,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
-
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 try:
     import triton
@@ -32,6 +31,13 @@ try:
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
+
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+fused_loss_fn = LigerFusedLinearCrossEntropyLoss(softcap=float(os.environ.get('LOGIT_SOFTCAP', 30.0)))
+torch._dynamo.config.capture_scalar_outputs = True
+
+def run_fused_loss(projection_weight, hidden_states, target_ids):
+    return fused_loss_fn(projection_weight.float(), hidden_states.float(), target_ids.reshape(-1))
 
 # ----------------------------------------
 # Hyperparameters
@@ -581,14 +587,16 @@ class Block(nn.Module):
         return x_out
 
 
+class GptModes(Enum):
+    TRAIN = auto()
+    EVAL = auto()
+
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
-        if h.logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {h.logit_softcap}")
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
-        self.logit_softcap = h.logit_softcap
+        
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
@@ -598,44 +606,35 @@ class GPT(nn.Module):
             self.head_proj = None
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
+        
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
                   h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale,
                   parallel=(i >= h.parallel_residual_start))
             for i in range(h.num_layers)
         ])
+        
         if h.rope_dims > 0:
             head_dim = h.model_dim // h.num_heads
             for block in self.blocks:
                 block.attn.rope_dims = h.rope_dims
                 block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+        
         self.final_norm = RMSNorm()
         self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        
         if h.xsa_last_n > 0:
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
 
-        # Layer looping
-        self.looping_active: bool = False
-        if h.num_loops > 0:
-            loop_seg = list(range(h.loop_start, h.loop_end + 1))
-            all_indices = list(range(h.loop_start))
-            for _ in range(h.num_loops + 1):
-                all_indices.extend(loop_seg)
-            all_indices.extend(range(h.loop_end + 1, h.num_layers))
-            num_enc = len(all_indices) // 2
-            self.encoder_indices: list[int] = all_indices[:num_enc]
-            self.decoder_indices: list[int] = all_indices[num_enc:]
-        else:
-            self.encoder_indices = list(range(self.num_encoder_layers))
-            self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
-        self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
-        self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
-
+        
         self._init_weights()
+
+        self.logit_softcap = h.logit_softcap
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -655,19 +654,15 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips: list[Tensor] = []
-        enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
-        dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+        enc_iter = range(self.num_encoder_layers)
+        dec_iter = range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
         for i in enc_iter:
             x = self.blocks[i](x, x0)
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
                 scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
-                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
-                    x = torch.lerp(scaled_skip, x, g)
-                else:
-                    x = x + scaled_skip
+                x = x + scaled_skip
             x = self.blocks[i](x, x0)
         x = self.final_norm(x)
         if self.head_proj is not None:
@@ -678,10 +673,32 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits = self.forward_logits(input_ids)
-        return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
+    def _forward_training(self, input_ids: Tensor):
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        return x
+
+    def forward(self, mode: GptModes, input_ids: Tensor, target_ids=None) -> Tensor:
+        if mode == GptModes.TRAIN:
+            return self._forward_training(input_ids)
+        elif mode == GptModes.EVAL:
+            logits = self.forward_logits(input_ids)
+            return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
+        else:
+            raise ValueError(f"received unexpected {mode=}")
 
 
 def classify_param(name: str) -> str:
@@ -800,8 +817,6 @@ class Optimizers():
         ]
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
-        if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
-            scalar_params.append(base_model.skip_gates)
 
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -830,16 +845,7 @@ class Optimizers():
             fused=True,
         )
         self.optimizers = [self.optimizer_tok, self.optimizer_muon, self.optimizer_scalar]
-        if base_model.lm_head is not None:
-            self.optimizer_head = torch.optim.Adam(
-                [{"params": [base_model.lm_head.weight], "lr": h.head_lr, "base_lr": h.head_lr}],
-                betas=(h.beta1, h.beta2),
-                eps=h.adam_eps,
-                fused=True,
-            )
-            self.optimizers.insert(1, self.optimizer_head)
-        else:
-            self.optimizer_head = None
+        self.optimizer_head = None
 
     def __iter__(self):
         return iter(self.optimizers)
@@ -895,7 +901,7 @@ def collect_hessians(
                 hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
 
     if model.tie_embeddings:
-        hook_module = model.head_proj if model.head_proj is not None else model.final_norm
+        hook_module = model.final_norm
         def make_output_hook(name: str):
             def hook_fn(module, inp, out):
                 x = out.detach().float()
@@ -1178,7 +1184,7 @@ def eval_val(
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(GptModes.EVAL, x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -1327,7 +1333,15 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                # 1. Forward pass (only calculates hidden states, handled by torch.compile)
+                hidden_states = model(GptModes.TRAIN, x) 
+
+                # 2. Get the weights for projection (handle DDP wrapper if necessary)
+                raw_model = model.module if hasattr(model, 'module') else model
+                projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
+
+                # 3. Calculate Loss (runs in Eager mode using Liger's optimized Triton kernel)
+                loss = run_fused_loss(projection_weight, hidden_states, y)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
@@ -1359,7 +1373,6 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                 log(f"warmup_step: {warmup_step + 1}/{h.warmup_steps}")
         if h.num_loops > 0:
             base_model.looping_active = True
-            log(f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
             for warmup_step in range(h.warmup_steps):
                 step_fn(warmup_step, 1.0)
                 if warmup_step <= 5 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == h.warmup_steps:
@@ -1408,7 +1421,6 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         scale = lr_mul(frac)
         if h.num_loops > 0 and not base_model.looping_active and frac >= h.enable_looping_at:
             base_model.looping_active = True
-            log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
         train_loss = step_fn(step, scale)
 
         with torch.no_grad():
@@ -1531,7 +1543,5 @@ def main():
     if distributed:
         dist.destroy_process_group()
 
-
 if __name__ == "__main__":
     main()
-
