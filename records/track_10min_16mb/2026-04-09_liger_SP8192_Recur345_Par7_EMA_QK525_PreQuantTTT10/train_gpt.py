@@ -27,6 +27,14 @@ try:
 except ImportError:
     _HAS_BROTLI = False
 
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+fused_loss_fn = LigerFusedLinearCrossEntropyLoss(softcap=float(os.environ.get('LOGIT_SOFTCAP', 30.0)))
+torch._dynamo.config.capture_scalar_outputs = True
+
+def run_fused_loss(projection_weight, hidden_states, target_ids):
+    return fused_loss_fn(projection_weight.float(), hidden_states.float(), target_ids.reshape(-1))
+
+
 # ----------------------------------------
 # Hyperparameters
 # ----------------------------------------
@@ -708,7 +716,7 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
+    def _common_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -777,6 +785,10 @@ class GPT(nn.Module):
             x = m * lane0 + (1 - m) * lane1
 
         x = self.final_norm(x)
+        return x
+    
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        x = self._common_logits(input_ids)
         if self.head_proj is not None:
             x = self.head_proj(x)
         if self.tie_embeddings:
@@ -786,6 +798,13 @@ class GPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        if self.training:
+            hidden_states = self._common_logits(input_ids)
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+            projection_weight = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
+            def loss_calc():
+                return run_fused_loss(projection_weight, hidden_states, target_ids)
+            return loss_calc
         logits = self.forward_logits(input_ids)
         return F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
@@ -1325,7 +1344,8 @@ def prequant_ttt_adapt_adamw(
             y = local[1:].reshape(-1, seq_len)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = base_model(x, y)
+                loss_calc = base_model(x, y)
+                loss = loss_calc()
             loss.backward()
             if world_size > 1:
                 for p in ttt_params:
@@ -1707,7 +1727,8 @@ def eval_val_ttt(
                         y = local[1:].reshape(-1, seq_len)
                         optimizer.zero_grad(set_to_none=True)
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = base_model(x, y)
+                            loss_calc = base_model(x, y)
+                            loss = loss_calc()
                         loss.backward()
                         if world_size > 1:
                             for p in ttt_params:
@@ -1822,7 +1843,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
             x, y = train_loader.next_batch(h.train_batch_tokens, h.train_seq_len, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss_calc = model(x, y)
+                loss = loss_calc()
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps

@@ -33,6 +33,11 @@ except ImportError:
   except ImportError:
    _HAS_FA3 = False
    flash_attn_3_func = None
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+fused_loss_fn = LigerFusedLinearCrossEntropyLoss(softcap=float(os.environ.get("LOGIT_SOFTCAP", 30.0)))
+torch._dynamo.config.capture_scalar_outputs = True
+def run_fused_loss(projection_weight, hidden_states, target_ids):
+    return fused_loss_fn(projection_weight.float(), hidden_states.float(), target_ids)
 class Hyperparameters:
  data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
  train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -678,7 +683,7 @@ class GPT(nn.Module):
   ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
   ve_idx = self.ve_layer_indices.index(layer_idx)
   return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
- def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+ def _forward_eval(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
   x = self.tok_emb(input_ids)
   if self.bigram is not None:
    x = x + self.bigram(input_ids)
@@ -728,6 +733,55 @@ class GPT(nn.Module):
    if mtp_loss_count > 0:
     main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
   return main_loss
+ def _forward_training(self, input_ids: Tensor, target_ids: Tensor):
+  x = self.tok_emb(input_ids)
+  if self.bigram is not None:
+   x = x + self.bigram(input_ids)
+  x = F.rms_norm(x, (x.size(-1),))
+  x = self.smear(x)
+  x0 = x
+  skips: list[Tensor] = []
+  ve_cache: dict = {}
+  v_first: Tensor | None = None
+  for i in range(self.num_encoder_layers):
+   ve = self._get_ve(i, input_ids, ve_cache)
+   x, v_raw = self.blocks[i](x, x0, v_embed=ve, v_first=v_first if self.vrl_enabled else None)
+   if i == 0 and self.vrl_enabled:
+    v_first = v_raw
+   skips.append(x)
+  for i in range(self.num_decoder_layers):
+   bi = self.num_encoder_layers + i
+   if skips:
+    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+   ve = self._get_ve(bi, input_ids, ve_cache)
+   x, _ = self.blocks[bi](x, x0, v_embed=ve, v_first=v_first if self.vrl_enabled else None)
+  x = self.final_norm(x)
+  x_flat = x.reshape(-1, x.size(-1))
+
+  def loss_calculator():
+   targets = target_ids.reshape(-1)
+   projection_weight = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
+   main_loss = run_fused_loss(projection_weight, x_flat, targets)
+   if self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
+    _, seqlen, dim = x.shape
+    mtp_loss_sum = x.new_zeros(())
+    mtp_loss_count = 0
+    for k, mtp_head in enumerate(self.mtp_heads):
+     valid_t = seqlen - (k + 1)
+     if valid_t <= 0:
+      continue
+     mtp_hidden = x[:, :valid_t, :].reshape(-1, dim)
+     mtp_targets = target_ids[:, k + 1 :].reshape(-1)
+     mtp_projection_weight = mtp_head.weight
+     mtp_loss_sum += run_fused_loss(mtp_projection_weight, mtp_hidden, mtp_targets)    
+     mtp_loss_count += 1
+    if mtp_loss_count > 0:
+     main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+   return main_loss 
+
+  return loss_calculator
+ def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+  return self._forward_training(input_ids, target_ids) if self.training else self._forward_eval(input_ids, target_ids)
  def forward_hidden(self, input_ids: Tensor) -> Tensor:
   x = self.tok_emb(input_ids)
   if self.bigram is not None:
@@ -1267,7 +1321,8 @@ def main() -> None:
      model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
     x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-     warmup_loss = model(x, y)
+     loss_calculator = model(x, y)
+     warmup_loss = loss_calculator()
     (warmup_loss * grad_scale).backward()
    for opt in optimizers:
     opt.step()
@@ -1333,7 +1388,8 @@ def main() -> None:
     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-    loss = model(x, y)
+    loss_calculator = model(x, y)
+    loss = loss_calculator()
    train_loss += loss.detach()
    (loss * grad_scale).backward()
   train_loss /= grad_accum_steps
