@@ -801,10 +801,7 @@ class GPT(nn.Module):
         if self.training:
             hidden_states = self._common_logits(input_ids)
             hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
-            projection_weight = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
-            def loss_calc():
-                return run_fused_loss(projection_weight, hidden_states, target_ids)
-            return loss_calc
+            return hidden_states
         logits = self.forward_logits(input_ids)
         return F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
@@ -1344,8 +1341,10 @@ def prequant_ttt_adapt_adamw(
             y = local[1:].reshape(-1, seq_len)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss_calc = base_model(x, y)
-                loss = loss_calc()
+                hidden_states = base_model(x, y)
+                raw_model = base_model.module if hasattr(base_model, 'module') else base_model
+                projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
+                loss = run_fused_loss(projection_weight, hidden_states, y)
             loss.backward()
             if world_size > 1:
                 for p in ttt_params:
@@ -1727,8 +1726,10 @@ def eval_val_ttt(
                         y = local[1:].reshape(-1, seq_len)
                         optimizer.zero_grad(set_to_none=True)
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss_calc = base_model(x, y)
-                            loss = loss_calc()
+                            hidden_states = base_model(x, y)
+                            raw_model = base_model.module if hasattr(base_model, 'module') else base_model
+                            projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
+                            loss = run_fused_loss(projection_weight, hidden_states, y)
                         loss.backward()
                         if world_size > 1:
                             for p in ttt_params:
@@ -1843,8 +1844,10 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
             x, y = train_loader.next_batch(h.train_batch_tokens, h.train_seq_len, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss_calc = model(x, y)
-                loss = loss_calc()
+                hidden_states = model(x, y)
+                raw_model = model.module if hasattr(model, 'module') else model
+                projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
+                loss = run_fused_loss(projection_weight, hidden_states, y)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
