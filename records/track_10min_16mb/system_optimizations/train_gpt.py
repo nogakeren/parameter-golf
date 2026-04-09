@@ -587,10 +587,6 @@ class Block(nn.Module):
         return x_out
 
 
-class GptModes(Enum):
-    TRAIN = auto()
-    EVAL = auto()
-
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -691,15 +687,11 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         return x
 
-    def forward(self, mode: GptModes, input_ids: Tensor, target_ids=None) -> Tensor:
-        if mode == GptModes.TRAIN:
+    def forward(self, input_ids: Tensor, target_ids=None) -> Tensor:
+        if self.training:
             return self._forward_training(input_ids)
-        elif mode == GptModes.EVAL:
-            logits = self.forward_logits(input_ids)
-            return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
-        else:
-            raise ValueError(f"received unexpected {mode=}")
-
+        logits = self.forward_logits(input_ids)
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
 
 def classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
@@ -1184,7 +1176,7 @@ def eval_val(
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(GptModes.EVAL, x, y).detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -1333,14 +1325,9 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                # 1. Forward pass (only calculates hidden states, handled by torch.compile)
-                hidden_states = model(GptModes.TRAIN, x) 
-
-                # 2. Get the weights for projection (handle DDP wrapper if necessary)
+                hidden_states = model(x) 
                 raw_model = model.module if hasattr(model, 'module') else model
                 projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
-
-                # 3. Calculate Loss (runs in Eager mode using Liger's optimized Triton kernel)
                 loss = run_fused_loss(projection_weight, hidden_states, y)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
