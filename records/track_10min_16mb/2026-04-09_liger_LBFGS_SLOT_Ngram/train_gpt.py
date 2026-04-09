@@ -756,30 +756,24 @@ class GPT(nn.Module):
    ve = self._get_ve(bi, input_ids, ve_cache)
    x, _ = self.blocks[bi](x, x0, v_embed=ve, v_first=v_first if self.vrl_enabled else None)
   x = self.final_norm(x)
-  x_flat = x.reshape(-1, x.size(-1))
+  mtp_loss = 0
+  if self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
+   _, seqlen, dim = x.shape
+   mtp_loss_sum = x.new_zeros(())
+   mtp_loss_count = 0
+   for k, mtp_head in enumerate(self.mtp_heads):
+    valid_t = seqlen - (k + 1)
+    if valid_t <= 0:
+     continue
+    mtp_hidden = x[:, :valid_t, :].reshape(-1, dim)
+    mtp_targets = target_ids[:, k + 1 :].reshape(-1)
+    mtp_projection_weight = mtp_head.weight
+    mtp_loss_sum += run_fused_loss(mtp_projection_weight, mtp_hidden, mtp_targets)    
+    mtp_loss_count += 1
+   if mtp_loss_count > 0:
+    mtp_loss += self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+  return x.reshape(-1, x.size(-1)), mtp_loss 
 
-  def loss_calculator():
-   targets = target_ids.reshape(-1)
-   projection_weight = self.tok_emb.weight if self.tie_embeddings else self.lm_head.weight
-   main_loss = run_fused_loss(projection_weight, x_flat, targets)
-   if self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
-    _, seqlen, dim = x.shape
-    mtp_loss_sum = x.new_zeros(())
-    mtp_loss_count = 0
-    for k, mtp_head in enumerate(self.mtp_heads):
-     valid_t = seqlen - (k + 1)
-     if valid_t <= 0:
-      continue
-     mtp_hidden = x[:, :valid_t, :].reshape(-1, dim)
-     mtp_targets = target_ids[:, k + 1 :].reshape(-1)
-     mtp_projection_weight = mtp_head.weight
-     mtp_loss_sum += run_fused_loss(mtp_projection_weight, mtp_hidden, mtp_targets)    
-     mtp_loss_count += 1
-    if mtp_loss_count > 0:
-     main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
-   return main_loss 
-
-  return loss_calculator
  def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
   return self._forward_training(input_ids, target_ids) if self.training else self._forward_eval(input_ids, target_ids)
  def forward_hidden(self, input_ids: Tensor) -> Tensor:
@@ -1321,8 +1315,10 @@ def main() -> None:
      model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
     x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-     loss_calculator = model(x, y)
-     warmup_loss = loss_calculator()
+     x, mtp_loss = model(x, y)
+     raw_model = model.module if hasattr(model, 'module') else model
+     projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
+     warmup_loss = mtp_loss + run_fused_loss(projection_weight, x, y.reshape(-1))
     (warmup_loss * grad_scale).backward()
    for opt in optimizers:
     opt.step()
@@ -1388,8 +1384,10 @@ def main() -> None:
     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-    loss_calculator = model(x, y)
-    loss = loss_calculator()
+    x, mtp_loss = model(x, y)
+    raw_model = model.module if hasattr(model, 'module') else model
+    projection_weight = raw_model.tok_emb.weight if raw_model.tie_embeddings else raw_model.lm_head.weight
+    loss = mtp_loss + run_fused_loss(projection_weight, x, y.reshape(-1))
    train_loss += loss.detach()
    (loss * grad_scale).backward()
   train_loss /= grad_accum_steps
