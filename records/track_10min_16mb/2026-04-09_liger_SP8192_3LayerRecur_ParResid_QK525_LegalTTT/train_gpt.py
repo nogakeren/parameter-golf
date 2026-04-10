@@ -4,7 +4,8 @@ import random,re,subprocess,sys,time,uuid,numpy as np,sentencepiece as spm,torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
-from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss, LigerRMSNorm
+from liger_kernel.ops.rope import LigerRopeFunction
 fused_loss_fn = LigerFusedLinearCrossEntropyLoss(softcap=float(os.environ.get('LOGIT_SOFTCAP', 30.0)))
 torch._dynamo.config.capture_scalar_outputs = True
 def run_fused_loss(projection_weight, hidden_states, target_ids):
@@ -90,9 +91,26 @@ class Rotary(nn.Module):
 			else:inv_freq=self.inv_freq.to(device)
 			t=torch.arange(seq_len,device=device,dtype=inv_freq.dtype);freqs=torch.outer(t,inv_freq);self._cos_cached=freqs.cos()[None,:,None,:];self._sin_cached=freqs.sin()[None,:,None,:];self._seq_len_cached=seq_len
 		return self._cos_cached.to(dtype=dtype),self._sin_cached.to(dtype=dtype)
-def apply_rotary_emb(x,cos,sin,rope_dims=0):
-	if rope_dims>0 and rope_dims<x.size(-1):x_rope,x_pass=x[...,:rope_dims],x[...,rope_dims:];half=rope_dims//2;x1,x2=x_rope[...,:half],x_rope[...,half:];x_rope=torch.cat((x1*cos+x2*sin,x1*-sin+x2*cos),dim=-1);return torch.cat((x_rope,x_pass),dim=-1)
-	half=x.size(-1)//2;x1,x2=x[...,:half],x[...,half:];return torch.cat((x1*cos+x2*sin,x1*-sin+x2*cos),dim=-1)
+	
+def apply_liger_rope(q, k, cos, sin, rope_dims):
+    # We must ensure q and k are contiguous for the Triton kernel
+    # and we slice to handle your partial RoPE logic
+    if 0 < rope_dims < q.size(-1):
+        q_rope = q[..., :rope_dims].contiguous()
+        k_rope = k[..., :rope_dims].contiguous()
+        
+        # LigerRopeFunction.apply handles the in-place rotation
+        # Use return values to satisfy the compiler's tracking
+        q_rotated, k_rotated = LigerRopeFunction.apply(q_rope, k_rope, cos, sin)
+        
+        # Stitch back together
+        q = torch.cat([q_rotated, q[..., rope_dims:]], dim=-1)
+        k = torch.cat([k_rotated, k[..., rope_dims:]], dim=-1)
+    else:
+        q, k = LigerRopeFunction.apply(q.contiguous(), k.contiguous(), cos, sin)
+    return q, k
+
+
 class CausalSelfAttention(nn.Module):
 	def __init__(self,dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len):
 		super().__init__()
@@ -103,7 +121,9 @@ class CausalSelfAttention(nn.Module):
 		kv_dim=self.num_kv_heads*self.head_dim;self.c_q=CastedLinear(dim,dim,bias=False);self.c_k=CastedLinear(dim,kv_dim,bias=False);self.c_v=CastedLinear(dim,kv_dim,bias=False);self.proj=CastedLinear(dim,dim,bias=False);self.proj._zero_init=True;self.q_gain=nn.Parameter(torch.full((num_heads,),qk_gain_init,dtype=torch.float32));self.rope_dims=0;self.rotary=Rotary(self.head_dim,base=rope_base,train_seq_len=train_seq_len);self.use_xsa=False
 	def _xsa_efficient(self,y,v):B,T,H,D=y.shape;Hkv=v.size(-2);group=H//Hkv;y_g=y.reshape(B,T,Hkv,group,D);vn=F.normalize(v,dim=-1).unsqueeze(-2);proj=(y_g*vn).sum(dim=-1,keepdim=True)*vn;return(y_g-proj).reshape(B,T,H,D)
 	def forward(self,x):
-		bsz,seqlen,dim=x.shape;q=self.c_q(x).reshape(bsz,seqlen,self.num_heads,self.head_dim);k=self.c_k(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);v=self.c_v(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);q=F.rms_norm(q,(q.size(-1),));k=F.rms_norm(k,(k.size(-1),));cos,sin=self.rotary(seqlen,x.device,q.dtype);q=apply_rotary_emb(q,cos,sin,self.rope_dims);k=apply_rotary_emb(k,cos,sin,self.rope_dims);q=q*self.q_gain.to(dtype=q.dtype)[None,None,:,None];y=flash_attn_3_func(q,k,v,causal=True)
+		bsz,seqlen,dim=x.shape;q=self.c_q(x).reshape(bsz,seqlen,self.num_heads,self.head_dim);k=self.c_k(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);v=self.c_v(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);q=F.rms_norm(q,(q.size(-1),));k=F.rms_norm(k,(k.size(-1),));cos,sin=self.rotary(seqlen,x.device,q.dtype);
+		q, k = apply_liger_rope(q, k, cos, sin, self.rope_dims)
+		q=q*self.q_gain.to(dtype=q.dtype)[None,None,:,None];y=flash_attn_3_func(q,k,v,causal=True)
 		if self.use_xsa:y=self._xsa_efficient(y,v)
 		y=y.reshape(bsz,seqlen,dim);return self.proj(y)
 class MLP(nn.Module):
