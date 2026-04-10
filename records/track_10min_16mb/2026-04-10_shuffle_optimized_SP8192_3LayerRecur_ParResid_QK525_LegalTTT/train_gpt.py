@@ -92,7 +92,7 @@ class PyTorchShuffledLoader(IterableDataset):
         while True:
             yield self.loader.next_batch()
 def create_loader(h,device) -> DataLoader:
-	dataset = PyTorchShuffledLoader(h, device); return DataLoader(dataset, batch_size=1, pin_memory=True, prefetch_factor=10)
+	dataset = PyTorchShuffledLoader(h, device); return DataLoader(dataset, batch_size=1, pin_memory=True, prefetch_factor=10, num_workers=2)
 class RMSNorm(nn.Module):
 	def __init__(self,eps=None):super().__init__();self.eps=eps
 	def forward(self,x):return F.rms_norm(x,(x.size(-1),),eps=self.eps)
