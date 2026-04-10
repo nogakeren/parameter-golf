@@ -62,71 +62,97 @@ class ShuffledSequenceLoader:
         self.seq_len = h.train_seq_len
         self.device = device
 
-        all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
-        if not all_files:
+        files = [Path(p) for p in sorted(glob.glob(h.train_files))]
+        if not files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
 
-        self.files = all_files[h.rank::h.world_size]
+        self.files = files[h.rank::h.world_size]
         self.rng = np.random.Generator(np.random.PCG64(h.rank))
 
-        # Cache memmaps for faster reads
-        self.memmaps = [_get_shard_memmap(f) for f in self.files]
+        # cache memmaps
+        self.mm = [_get_shard_memmap(f) for f in self.files]
+        self.num_tokens = [len(m) for m in self.mm]
 
-        self.num_tokens = [len(mm) for mm in self.memmaps]
         self.start_inds = [[] for _ in self.files]
 
-        for si in range(len(self.files)):
-            self._reset_shard(si)
+        for i in range(len(self.files)):
+            self._reset_shard(i)
 
     def _reset_shard(self, si):
         max_phase = min(
             self.seq_len - 1,
-            max(0, self.num_tokens[si] - self.seq_len - 1)
+            max(0, self.num_tokens[si] - self.seq_len - 1),
         )
+
         phase = int(self.rng.integers(max_phase + 1)) if max_phase > 0 else 0
 
         num_sequences = (self.num_tokens[si] - 1 - phase) // self.seq_len
-        sequence_order = self.rng.permutation(num_sequences)
+        perm = self.rng.permutation(num_sequences)
 
-        self.start_inds[si] = (phase + sequence_order * self.seq_len).tolist()
+        self.start_inds[si] = (phase + perm * self.seq_len).tolist()
 
     def next_batch(self, global_tokens, grad_accum_steps):
         device_tokens = global_tokens // (self.world_size * grad_accum_steps)
         B = device_tokens // self.seq_len
 
-        # Pinned memory for fast H2D transfer
+        # ---- pinned output buffers ----
         x = torch.empty((B, self.seq_len), dtype=torch.int64, pin_memory=True)
         y = torch.empty((B, self.seq_len), dtype=torch.int64, pin_memory=True)
 
-        remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
+        # ---- flatten all available starts ----
+        all_starts = []
+        all_shards = []
 
-        for bi in range(B):
-            total = remaining.sum()
-            if total <= 0:
-                for si in range(len(self.files)):
-                    self._reset_shard(si)
-                remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
-                total = remaining.sum()
+        for si, starts in enumerate(self.start_inds):
+            all_starts.extend(starts)
+            all_shards.extend([si] * len(starts))
 
-            probs = remaining / total
-            si = int(self.rng.choice(len(self.files), p=probs))
-            start_ind = self.start_inds[si].pop()
-            remaining[si] -= 1
+        all_starts = np.array(all_starts, dtype=np.int64)
+        all_shards = np.array(all_shards, dtype=np.int64)
 
-            # Read directly from the cached memmap
-            mm = self.memmaps[si]
-            
-            # Cast to int64 in numpy before sending to torch
-            window = np.array(mm[start_ind:start_ind + self.seq_len + 1], dtype=np.int64)
-            window_t = torch.from_numpy(window)
+        # reshuffle globally
+        perm = self.rng.permutation(len(all_starts))
+        all_starts = all_starts[perm]
+        all_shards = all_shards[perm]
 
-            # Direct assignment avoids the .copy_() advanced indexing trap
-            x[bi] = window_t[:-1]
-            y[bi] = window_t[1:]
+        # take batch
+        batch_starts = all_starts[:B]
+        batch_shards = all_shards[:B]
+
+        # consume used indices
+        used = perm[:B]
+        for si in range(len(self.files)):
+            mask = batch_shards == si
+            self.start_inds[si] = [
+                s for j, s in enumerate(self.start_inds[si])
+                if j not in used[mask]
+            ]
+
+            if len(self.start_inds[si]) == 0:
+                self._reset_shard(si)
+
+        # ---- MAIN FAST PATH ----
+        # allocate contiguous buffer first (NO per-sample ops)
+        x_cpu = np.empty((B, self.seq_len), dtype=np.int64)
+        y_cpu = np.empty((B, self.seq_len), dtype=np.int64)
+
+        for i in range(B):
+            mm = self.mm[batch_shards[i]]
+            s = batch_starts[i]
+
+            # direct memmap slice (cheap)
+            chunk = mm[s:s + self.seq_len + 1]
+
+            x_cpu[i] = chunk[:-1]
+            y_cpu[i] = chunk[1:]
+
+        # single conversion to torch
+        x.copy_(torch.from_numpy(x_cpu))
+        y.copy_(torch.from_numpy(y_cpu))
 
         return (
             x.to(self.device, non_blocking=True),
-            y.to(self.device, non_blocking=True)
+            y.to(self.device, non_blocking=True),
         )
 
 class RMSNorm(nn.Module):
