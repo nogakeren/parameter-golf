@@ -434,9 +434,22 @@ def train_model(h,device,val_data):
 		optimizers.step();return train_loss
 	if h.warmup_steps>0:
 		initial_model_state={name:tensor.detach().cpu().clone()for(name,tensor)in base_model.state_dict().items()};initial_optimizer_states=[copy.deepcopy(opt.state_dict())for opt in optimizers];model.train()
+		prof= torch.profiler.profile(
+			activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+			on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/profiler_onestep_trace'),
+			schedule=torch.profiler.schedule(wait=10, warmup=5, active=5),
+			record_shapes=True,
+			profile_memory=True,
+			experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
+			with_stack=True # THIS IS THE KEY
+		)
+		prof.start()
 		for warmup_step in range(h.warmup_steps):
+			prof.step()
 			step_fn(warmup_step,1.)
 			if warmup_step<=5 or(warmup_step+1)%10==0 or warmup_step+1==h.warmup_steps:log(f"warmup_step: {warmup_step+1}/{h.warmup_steps}")
+		prof.stop()
+		exit(1)
 		if h.num_loops>0:
 			base_model.looping_active=True;log(f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 			for warmup_step in range(h.warmup_steps):
