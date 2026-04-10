@@ -265,7 +265,7 @@ def collect_hessians(model,train_loader,h,device,n_calibration_batches=64):
 		hooks.append(hook_module.register_forward_hook(make_output_hook('tok_emb.weight')))
 	model.eval()
 	with torch.no_grad():
-		for _ in range(n_calibration_batches):x,_=train_loader.next_batch();model.forward_logits(x)
+		for _ in range(n_calibration_batches):x,_=next(iter(train_loader));model.forward_logits(x)
 	for hook in hooks:hook.remove()
 	for name in hessians:hessians[name]=hessians[name].cpu()/n_calibration_batches
 	return hessians
@@ -415,7 +415,7 @@ def train_model(h,device,val_data):
 		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device)
 		for micro_step in range(h.grad_accum_steps):
 			if h.distributed:model.require_backward_grad_sync=micro_step==h.grad_accum_steps-1
-			x,y=train_loader.next_batch()
+			x,y=next(iter(train_loader))
 			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
 			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
 		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
