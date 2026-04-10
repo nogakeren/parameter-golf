@@ -55,22 +55,96 @@ def _get_shard_memmap(file):
 	key=str(file);mm=_MMAP_CACHE.get(key)
 	if mm is not None:return mm
 	n=_read_num_tokens(file);mm=np.memmap(file,mode='r',dtype='<u2',offset=_SHARD_HEADER_BYTES,shape=(n,));_MMAP_CACHE[key]=mm;return mm
+
 class ShuffledSequenceLoader:
-	def __init__(self,h,device):
-		self.world_size=h.world_size;self.seq_len=h.train_seq_len;self.device=device;all_files=[Path(p)for p in sorted(glob.glob(h.train_files))]
-		if not all_files:raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
-		self.files=all_files[h.rank::h.world_size];self.rng=np.random.Generator(np.random.PCG64(h.rank));self.num_tokens=[_read_num_tokens(f)for f in self.files];self.start_inds=[[]for _ in self.files]
-		for si in range(len(self.files)):self._reset_shard(si)
-	def _reset_shard(self,si):max_phase=min(self.seq_len-1,max(0,self.num_tokens[si]-self.seq_len-1));phase=int(self.rng.integers(max_phase+1))if max_phase>0 else 0;num_sequences=(self.num_tokens[si]-1-phase)//self.seq_len;sequence_order=self.rng.permutation(num_sequences);self.start_inds[si]=(phase+sequence_order*self.seq_len).tolist()
-	def next_batch(self,global_tokens,grad_accum_steps):
-		device_tokens=global_tokens//(self.world_size*grad_accum_steps);device_batch_size=device_tokens//self.seq_len;remaining=np.array([len(s)for s in self.start_inds],dtype=np.float64);x=torch.empty((device_batch_size,self.seq_len),dtype=torch.int64,pin_memory=True);y=torch.empty((device_batch_size,self.seq_len),dtype=torch.int64,pin_memory=True)
-		for bi in range(device_batch_size):
-			total=remaining.sum()
-			if total<=0:
-				for si in range(len(self.files)):self._reset_shard(si)
-				remaining=np.array([len(s)for s in self.start_inds],dtype=np.float64);total=remaining.sum()
-			probs=remaining/total;si=int(self.rng.choice(len(self.files),p=probs));start_ind=self.start_inds[si].pop();remaining[si]-=1;mm=_get_shard_memmap(self.files[si]);window=torch.as_tensor(np.array(mm[start_ind:start_ind+self.seq_len+1],dtype=np.int64));x[bi]=window[:-1];y[bi]=window[1:]
-		return x.to(self.device,non_blocking=True),y.to(self.device,non_blocking=True)
+    def __init__(self, h, device):
+        self.world_size = h.world_size
+        self.seq_len = h.train_seq_len
+        self.device = device
+
+        all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
+        if not all_files:
+            raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
+
+        self.files = all_files[h.rank::h.world_size]
+        self.rng = np.random.Generator(np.random.PCG64(h.rank))
+
+        # Cache memmaps (IMPORTANT)
+        self.memmaps = [_get_shard_memmap(f) for f in self.files]
+
+        self.num_tokens = [len(mm) for mm in self.memmaps]
+        self.start_inds = [[] for _ in self.files]
+
+        for si in range(len(self.files)):
+            self._reset_shard(si)
+
+    def _reset_shard(self, si):
+        max_phase = min(
+            self.seq_len - 1,
+            max(0, self.num_tokens[si] - self.seq_len - 1)
+        )
+        phase = int(self.rng.integers(max_phase + 1)) if max_phase > 0 else 0
+
+        num_sequences = (self.num_tokens[si] - 1 - phase) // self.seq_len
+        sequence_order = self.rng.permutation(num_sequences)
+
+        self.start_inds[si] = (phase + sequence_order * self.seq_len).tolist()
+
+    def next_batch(self, global_tokens, grad_accum_steps):
+        device_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        B = device_tokens // self.seq_len
+
+        # ✅ pinned memory for fast H2D
+        x = torch.empty((B, self.seq_len), dtype=torch.int64, pin_memory=True)
+        y = torch.empty((B, self.seq_len), dtype=torch.int64, pin_memory=True)
+
+        remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
+
+        # ---- sample all shard indices at once ----
+        shard_choices = []
+        for _ in range(B):
+            total = remaining.sum()
+            if total <= 0:
+                for si in range(len(self.files)):
+                    self._reset_shard(si)
+                remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
+                total = remaining.sum()
+
+            probs = remaining / total
+            si = int(self.rng.choice(len(self.files), p=probs))
+            shard_choices.append(si)
+            remaining[si] -= 1
+
+        shard_choices = np.array(shard_choices)
+
+        # ---- group by shard ----
+        for si in np.unique(shard_choices):
+            idxs = np.where(shard_choices == si)[0]
+            count = len(idxs)
+
+            starts = [self.start_inds[si].pop() for _ in range(count)]
+            starts = np.array(starts, dtype=np.int64)
+
+            mm = self.memmaps[si]
+
+            # ---- vectorized read ----
+            # shape: (count, seq_len+1)
+            windows = np.stack([
+                mm[s:s + self.seq_len + 1] for s in starts
+            ], axis=0)
+
+            # zero-copy into torch
+            windows_t = torch.from_numpy(windows)
+
+            # write into batch (contiguous block)
+            x[idxs].copy_(windows_t[:, :-1])
+            y[idxs].copy_(windows_t[:, 1:])
+
+        return (
+            x.to(self.device, non_blocking=True),
+            y.to(self.device, non_blocking=True),
+        )
+
 class RMSNorm(nn.Module):
 	def __init__(self,eps=None):super().__init__();self.eps=eps
 	def forward(self,x):return F.rms_norm(x,(x.size(-1),),eps=self.eps)
