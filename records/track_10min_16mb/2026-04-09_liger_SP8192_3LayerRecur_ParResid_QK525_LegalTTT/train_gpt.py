@@ -69,7 +69,7 @@ class ShuffledSequenceLoader:
         self.files = all_files[h.rank::h.world_size]
         self.rng = np.random.Generator(np.random.PCG64(h.rank))
 
-        # Cache memmaps (IMPORTANT)
+        # Cache memmaps for faster reads
         self.memmaps = [_get_shard_memmap(f) for f in self.files]
 
         self.num_tokens = [len(mm) for mm in self.memmaps]
@@ -94,15 +94,13 @@ class ShuffledSequenceLoader:
         device_tokens = global_tokens // (self.world_size * grad_accum_steps)
         B = device_tokens // self.seq_len
 
-        # ✅ pinned memory for fast H2D
+        # Pinned memory for fast H2D transfer
         x = torch.empty((B, self.seq_len), dtype=torch.int64, pin_memory=True)
         y = torch.empty((B, self.seq_len), dtype=torch.int64, pin_memory=True)
 
         remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
 
-        # ---- sample all shard indices at once ----
-        shard_choices = []
-        for _ in range(B):
+        for bi in range(B):
             total = remaining.sum()
             if total <= 0:
                 for si in range(len(self.files)):
@@ -112,37 +110,23 @@ class ShuffledSequenceLoader:
 
             probs = remaining / total
             si = int(self.rng.choice(len(self.files), p=probs))
-            shard_choices.append(si)
+            start_ind = self.start_inds[si].pop()
             remaining[si] -= 1
 
-        shard_choices = np.array(shard_choices)
-
-        # ---- group by shard ----
-        for si in np.unique(shard_choices):
-            idxs = np.where(shard_choices == si)[0]
-            count = len(idxs)
-
-            starts = [self.start_inds[si].pop() for _ in range(count)]
-            starts = np.array(starts, dtype=np.int64)
-
+            # Read directly from the cached memmap
             mm = self.memmaps[si]
+            
+            # Cast to int64 in numpy before sending to torch
+            window = np.array(mm[start_ind:start_ind + self.seq_len + 1], dtype=np.int64)
+            window_t = torch.from_numpy(window)
 
-            # ---- vectorized read ----
-            # shape: (count, seq_len+1)
-            windows = np.stack([
-                mm[s:s + self.seq_len + 1] for s in starts
-            ], axis=0)
-
-            # zero-copy into torch
-            windows_t = torch.from_numpy(windows)
-
-            # write into batch (contiguous block)
-            x[idxs].copy_(windows_t[:, :-1])
-            y[idxs].copy_(windows_t[:, 1:])
+            # Direct assignment avoids the .copy_() advanced indexing trap
+            x[bi] = window_t[:-1]
+            y[bi] = window_t[1:]
 
         return (
             x.to(self.device, non_blocking=True),
-            y.to(self.device, non_blocking=True),
+            y.to(self.device, non_blocking=True)
         )
 
 class RMSNorm(nn.Module):
